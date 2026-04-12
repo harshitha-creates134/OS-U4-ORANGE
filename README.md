@@ -192,7 +192,7 @@ sudo ./inode_explore
 >
 > **Q1.4:** In your completed `inode_explore.c`, what inode number does `stat()` return for the symlink vs what `lstat()` returns? Why are they different? Which one gives you the symlink's _own_ inode?
 >
-> **Q1.5:** A process opens a file, then a second process deletes it (the directory entry disappears). The file's data still exists on disk. Name the exact kernel data structure that prevents the inode and data blocks from being freed. What syscall by the first process finally triggers the free? Now consider: if the first process keeps the file open indefinitely, what happens to disk space?
+> **Q1.5:** A process opens a file, then a second process deletes it (the directory entry disappears). The file's data still exists on disk. Which field inside the in-memory inode tracks that the file is still open (the open-file-table reference count)? What syscall by the first process finally drops that count to zero and triggers the free? Now consider: if the first process keeps the file open indefinitely, what happens to disk space?
 
 **Screenshot 1:** `ls -li` showing inode numbers + link counts, `df -i /mnt/tiny` before and after exhaustion, and your completed `./inode_explore` output.
 
@@ -245,17 +245,18 @@ int main(void) {
 
     char buf[16] = {0};
 
-    // TODO 1: Seek fd1 to position 0, then read 3 bytes into buf.
-    //         Print: read(fd1, 3): "<buf>"  → fd1 offset now at 3
+    // TODO 1: Seek fd1 to position 0 with lseek(), then read 3 bytes into buf.
+    //         Zero buf before each read (memset). Print the result, e.g.:
+    //           printf("read(fd1, 3): \"%s\"  → fd1 offset now at 3\n", buf);
     //         Predict first: what 3 characters will you get?
 
-    // TODO 2: Without seeking, read 3 bytes from fd3 into buf.
-    //         Print: read(fd3, 3): "<buf>"  → shared offset, continues from 3
-    //         Predict first: does fd3 = dup(fd1) share the offset or start at 0?
+    // TODO 2: Without seeking, read 3 bytes from fd3 into buf (memset first).
+    //         Print:  printf("read(fd3, 3): \"%s\"  → shared offset, continues from 3\n", buf);
+    //         Predict first: does fd3 = dup(fd1) share the open file entry (and offset)?
 
-    // TODO 3: Without seeking, read 3 bytes from fd2 into buf.
-    //         Print: read(fd2, 3): "<buf>"  → independent open, starts at 0
-    //         Predict first: fd2 came from a separate open() - where is its offset?
+    // TODO 3: Without seeking, read 3 bytes from fd2 into buf (memset first).
+    //         Print:  printf("read(fd2, 3): \"%s\"  → independent open, starts at 0\n", buf);
+    //         Predict first: fd2 came from a separate open() - what is its offset?
 
     // Show /proc/self/fd
     printf("\n--- /proc/self/fd ---\n");
@@ -408,8 +409,12 @@ static void walk(const char *dir) { /* your code */ }
 
 // TODO 2: Implement find_dupes().
 //         Sort files[] by inode using qsort (write a comparator).
-//         Walk the sorted array; when two adjacent entries share an inode,
-//         print them together as a group. Only print groups of size >= 2.
+//         Walk the sorted array; when consecutive entries share an inode,
+//         print them as a group. Only print groups of size >= 2.
+//         Format each group as:
+//           inode 12345:
+//             /mnt/orange/etc/hostname
+//             /mnt/orange/etc/hostname.bak
 static void find_dupes(void) { /* your code */ }
 
 int main(int argc, char *argv[]) {
@@ -623,8 +628,12 @@ static void print_disks(const char *label) {
     }
 }
 
-// TODO: implement this function.
-// Reconstruct the data on failed_disk by XORing all surviving disks together.
+// TODO: Implement reconstruct(failed_disk).
+//       For each stripe s and each byte b, XOR all surviving disks together
+//       and write the result into disks[failed_disk][s][b].
+//       The failed disk's blocks are already zeroed before this is called.
+//       Recall: XOR is self-inverse. If P = A ^ B, then A = P ^ B.
+//       The loop structure mirrors the parity computation in main() below.
 static void reconstruct(int failed_disk) {
     (void)failed_disk;
     /* your code here */
@@ -660,12 +669,6 @@ int main(void) {
     memset(disks[failed_disk], 0, sizeof(disks[failed_disk]));
 
     printf("\n*** DISK %d FAILED ***\n", failed_disk);
-
-    // TODO: implement reconstruct(failed_disk).
-    // For each stripe s and each byte b, XOR all surviving disks into
-    // disks[failed_disk][s][b]. Remember: XOR is self-inverse -
-    // if P = A ^ B, then A = P ^ B. Zero-initialize first (already done above).
-    // Hint: the loop structure mirrors the parity computation above.
     reconstruct(failed_disk);
 
     print_disks("=== After reconstruction ===");
@@ -730,17 +733,15 @@ Every file read or write in Linux goes through the page cache - a region of phys
 #define BUF_SIZE (4 * 1024)   // 4 KB reads
 
 static double read_file(const char *path, int use_direct) {
-    // TODO: Build the open() flags.
-    //       When use_direct != 0, add O_DIRECT so reads bypass the page cache entirely.
-    //       Then open the file. If open fails, print the error and return -1.
-    int flags = O_RDONLY; /* add O_DIRECT when appropriate */
+    // TODO: Set the correct open() flags.
+    //       When use_direct != 0, add O_DIRECT to bypass the page cache entirely.
+    //       O_DIRECT transfers data directly between the disk and your buffer,
+    //       skipping the kernel's page cache on both reads and writes.
+    int flags = O_RDONLY; /* add O_DIRECT when use_direct != 0 */
     int fd = open(path, flags);
     if (fd < 0) { perror("open"); return -1; }
 
-    // TODO: Allocate the read buffer.
-    //       O_DIRECT requires the buffer address to be aligned to 4096 bytes -
-    //       use posix_memalign(&buf, 4096, BUF_SIZE). Why does the kernel require
-    //       this alignment? (Think about how O_DIRECT transfers data to the device.)
+    // Buffer must be 4096-byte aligned for O_DIRECT (DMA hardware requirement).
     void *buf;
     posix_memalign(&buf, 4096, BUF_SIZE);
 
@@ -789,11 +790,14 @@ sudo dd if=/dev/urandom of=/mnt/orange/bench.bin bs=1M count=32
 
 gcc -O0 -o cache_bench cache_bench.c
 
+# Check page cache size BEFORE the run
+grep -E 'Cached:|Buffers:' /proc/meminfo
+
 # Drop ALL cached file data from RAM, then run immediately
 sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
 sudo ./cache_bench /mnt/orange/bench.bin
 
-# Check how much of RAM is used by the page cache right now
+# Check page cache size AFTER the run - did it grow?
 grep -E 'Cached:|Buffers:' /proc/meminfo
 ```
 
@@ -803,7 +807,7 @@ grep -E 'Cached:|Buffers:' /proc/meminfo
 >
 > **Q6.3:** Two processes open `/mnt/orange/bench.bin` and both read it sequentially. Does the OS load two separate copies of the file into RAM? Connect your answer to what you observed in U3 about COW and shared physical frames - is the page cache using the same mechanism?
 
-**Screenshot 6:** Full `cache_bench` output showing cold, warm, and O_DIRECT timings with speedup ratios, and `grep Cached /proc/meminfo` before and after the run.
+**Screenshot 6:** Full `cache_bench` output showing cold, warm, and O_DIRECT timings with speedup ratios, and `grep Cached /proc/meminfo` output from both before and after the run.
 
 ---
 
