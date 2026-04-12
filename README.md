@@ -23,7 +23,8 @@ dd if=/dev/zero of=orange.img bs=1M count=256
 # Format it as ext4
 mkfs.ext4 -L ORANGE orange.img
 
-# Mount it
+# Mount it - the -o loop flag tells the kernel to treat the file as a block device,
+# so the filesystem inside it behaves exactly like one on a real disk.
 sudo mkdir -p /mnt/orange
 sudo mount -o loop orange.img /mnt/orange
 
@@ -35,6 +36,8 @@ sudo tar xzf alpine-minirootfs-3.21.3-x86_64.tar.gz -C /mnt/orange
 df -h /mnt/orange
 ls /mnt/orange
 ```
+
+`dumpe2fs` reads the **superblock** - the master record ext4 writes at format time. It stores the filesystem's fixed parameters: total blocks, block size, and how many inodes were pre-allocated. These numbers never change after `mkfs`, which is why inode exhaustion is permanent.
 
 ```bash
 # Record the filesystem metadata
@@ -111,6 +114,8 @@ rm -f tiny.img
 ```
 
 ### Code Task: Inode & Link Explorer
+
+`stat()` follows symbolic links and reports the **target file's** inode. `lstat()` does not follow - it reports the **symlink's own** inode. This distinction is what lets the kernel tell you whether a path *is* a symlink or merely *points through* one. The `follow` parameter in `print_stat` below selects which call to use.
 
 The program below creates a file and sets up three paths to it. Complete the four TODOs - each one targets a distinct concept:
 
@@ -258,7 +263,9 @@ int main(void) {
     //         Print:  printf("read(fd2, 3): \"%s\"  → independent open, starts at 0\n", buf);
     //         Predict first: fd2 came from a separate open() - what is its offset?
 
-    // Show /proc/self/fd
+    // The kernel exposes each process's open file descriptors as symlinks under
+    // /proc/<pid>/fd - each symlink points to the file that fd refers to.
+    // This lets you inspect the live FD table of a running process.
     printf("\n--- /proc/self/fd ---\n");
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/fd", getpid());
@@ -275,7 +282,9 @@ int main(void) {
 gcc -O0 -o fd_explore fd_explore.c
 sudo ./fd_explore
 
-# Use strace to see every syscall during a simple file operation
+# strace intercepts every system call a process makes and prints them to stderr.
+# It lets you see exactly how a program talks to the kernel - open, read, write, close.
+# Here we filter to just the file-related calls to watch what 'cat' actually does.
 strace -e openat,read,write,close cat /mnt/orange/etc/hostname 2>&1
 ```
 
@@ -332,6 +341,8 @@ time sudo ls /mnt/orange/etc > /dev/null
 echo "--- large directory (bigdir, 500 entries) ---"
 time sudo ls /mnt/orange/bigdir > /dev/null
 ```
+
+The standard `readdir()` library function hides the on-disk structure behind a clean API. To see the raw `(name, inode, record-length)` tuples the kernel actually returns, we call the underlying `getdents64` syscall directly. This exposes the `d_reclen` field - the variable-length record size that `readdir()` abstracts away.
 
 ```c
 // readdir_raw.c - read directory entries using getdents64 syscall
@@ -479,6 +490,8 @@ How does a filesystem decide _which blocks on disk_ hold a given file's data? Th
 
 ext4 uses extents (a form of indexed allocation). Let's see it in action, then build a FAT (linked allocation) simulator:
 
+`filefrag` asks the kernel for a file's extent map - the list of contiguous block ranges that make up the file on disk. One extent means the file is stored as a single contiguous run. Multiple extents mean it is fragmented across different locations, requiring separate seeks to read sequentially.
+
 ```bash
 # Create files of different sizes and check their extent layout
 sudo dd if=/dev/urandom of=/mnt/orange/small.bin bs=4K count=1
@@ -491,6 +504,8 @@ sudo filefrag -v /mnt/orange/medium.bin
 sudo filefrag -v /mnt/orange/large.bin
 ```
 
+In a FAT filesystem, the File Allocation Table is an array where `fat[i]` stores the index of the **next** block belonging to the same file, or a sentinel (`FAT_EOF`) if block `i` is the last one. To find block `k` of a file, you must follow `k` pointers in sequence - there is no shortcut. `fat_alloc` uses **first-fit**: it scans from block 0 and takes the first free run it finds. This is simple but can produce fragmented chains over time.
+
 ```c
 // fat_sim.c - simulate FAT-style linked allocation and measure random access cost
 #include <stdio.h>
@@ -501,7 +516,7 @@ sudo filefrag -v /mnt/orange/large.bin
 #define FAT_FREE   -1
 #define FAT_EOF    -2
 
-int fat[DISK_BLOCKS];   // FAT table: fat[i] = next block, or EOF
+int fat[DISK_BLOCKS];   // FAT table: fat[i] = next block in chain, or FAT_EOF
 
 // Allocate a file of n blocks using first-fit from FAT
 int fat_alloc(int n) {
@@ -594,7 +609,7 @@ RAID (Redundant Array of Independent Disks) combines multiple disks for performa
   0 redundancy                50% capacity wasted         only 1/N capacity wasted
 ```
 
-RAID 5 parity works by XOR: `P = D0 ⊕ D1`. If any one disk dies, the missing data can be reconstructed by XORing the remaining disks.
+RAID 5 parity works by XOR. For each stripe, the parity block `P = D0 ⊕ D1 ⊕ ... ⊕ Dn`. XOR has a key property: it is **self-inverse** - XORing any value with itself cancels it out (`A ⊕ A = 0`). This means if you know `P` and all data blocks except one, you can recover the missing block by XORing everything else: `D1 = P ⊕ D0` (since `P ⊕ D0 = D0 ⊕ D1 ⊕ D0 = D1`). This is why any single disk failure is recoverable.
 
 ```c
 // raid_sim.c
@@ -640,7 +655,8 @@ static void reconstruct(int failed_disk) {
 }
 
 int main(void) {
-    srand(42);
+    srand(42);  // Fixed seed so every run produces the same hex values -
+                // this makes the manual byte-by-byte verification in Q5.1 reproducible.
 
     // Write data blocks (skip parity disk for each stripe)
     for (int s = 0; s < NUM_STRIPES; s++) {
@@ -793,7 +809,9 @@ gcc -O0 -o cache_bench cache_bench.c
 # Check page cache size BEFORE the run
 grep -E 'Cached:|Buffers:' /proc/meminfo
 
-# Drop ALL cached file data from RAM, then run immediately
+# Writing to /proc/sys/vm/drop_caches tells the kernel to evict cached pages from RAM.
+# 1 = evict page cache (file data), 2 = evict dentries/inodes, 3 = evict both.
+# We use 3 to guarantee the next read hits the disk, not cache - producing a true cold read.
 sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
 sudo ./cache_bench /mnt/orange/bench.bin
 
