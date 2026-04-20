@@ -1,5 +1,5 @@
 # Lab: File Systems & Storage
-**Name:** Sanjay
+**Name:** Harshitha P
 **SRN:** PES1UG24CS186
 **Platform:** Ubuntu 22.04
 
